@@ -186,6 +186,7 @@ static unsigned int dev_num = 1;
 static struct cdev wlan_hdd_state_cdev;
 static struct class *class;
 static dev_t device;
+static bool hdd_loaded = false;
 
 /* the Android framework expects this param even though we don't use it */
 #define BUF_LEN 20
@@ -14164,6 +14165,7 @@ static void hdd_inform_wifi_off(void)
 	sme_free_blacklist(hdd_ctx->mac_handle);
 }
 
+static int hdd_driver_load(void);
 static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
 						const char __user *user_buf,
 						size_t count,
@@ -14193,6 +14195,13 @@ static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
 	if (strncmp(buf, wlan_on_str, strlen(wlan_on_str)) != 0) {
 		pr_err("Invalid value received from framework");
 		goto exit;
+	}
+
+	if (!hdd_loaded) {
+		if (hdd_driver_load()) {
+			pr_err("%s: Failed to init hdd module\n", __func__);
+			goto exit;
+		}
 	}
 
 	if (!cds_is_driver_loaded() || cds_is_driver_recovering()) {
@@ -14870,7 +14879,132 @@ reset_flags:
 
 static int con_mode_handler(const char *kmessage, const struct kernel_param *kp)
 {
-	int ret;
+	enum QDF_GLOBAL_MODE mode;
+	int errno;
+
+	errno = hdd_parse_driver_mode(kmessage, &mode);
+	if (errno) {
+		hdd_err_rl("Failed to parse driver mode '%s'", kmessage);
+		return errno;
+	}
+
+	return hdd_set_con_mode_cb(mode);
+}
+
+/**
+ * hdd_driver_load() - Perform the driver-level load operation
+ *
+ * Note: this is used in both static and DLKM driver builds
+ *
+ * Return: Errno
+ */
+static int hdd_driver_load(void)
+{
+	struct osif_driver_sync *driver_sync;
+	QDF_STATUS status;
+	int errno;
+
+	pr_err("%s: Loading driver v%s\n", WLAN_MODULE_NAME,
+	       g_wlan_driver_version);
+
+	status = hdd_qdf_init();
+	if (QDF_IS_STATUS_ERROR(status)) {
+		errno = qdf_status_to_os_return(status);
+		goto exit;
+	}
+
+	osif_sync_init();
+
+	status = osif_driver_sync_create_and_trans(&driver_sync);
+	if (QDF_IS_STATUS_ERROR(status)) {
+		hdd_err("Failed to init driver sync; status:%u", status);
+		errno = qdf_status_to_os_return(status);
+		goto sync_deinit;
+	}
+
+	errno = hdd_init();
+	if (errno) {
+		hdd_err("Failed to init HDD; errno:%d", errno);
+		goto trans_stop;
+	}
+
+	status = hdd_component_init();
+	if (QDF_IS_STATUS_ERROR(status)) {
+		hdd_err("Failed to init components; status:%u", status);
+		errno = qdf_status_to_os_return(status);
+		goto hdd_deinit;
+	}
+
+	status = qdf_wake_lock_create(&wlan_wake_lock, "wlan");
+	if (QDF_IS_STATUS_ERROR(status)) {
+		hdd_err("Failed to create wake lock; status:%u", status);
+		errno = qdf_status_to_os_return(status);
+		goto comp_deinit;
+	}
+
+	hdd_set_conparam(con_mode);
+
+	errno = pld_init();
+	if (errno) {
+		hdd_err("Failed to init PLD; errno:%d", errno);
+		goto wakelock_destroy;
+	}
+
+	hdd_driver_mode_change_register();
+
+	osif_driver_sync_register(driver_sync);
+	osif_driver_sync_trans_stop(driver_sync);
+
+	/* psoc probe can happen in registration; do after 'load' transition */
+	errno = wlan_hdd_register_driver();
+	if (errno) {
+		hdd_err("Failed to register driver; errno:%d", errno);
+		goto pld_deinit;
+	}
+
+	hdd_loaded = true;
+	hdd_debug("%s: driver loaded", WLAN_MODULE_NAME);
+
+	return 0;
+
+pld_deinit:
+	status = osif_driver_sync_trans_start(&driver_sync);
+	QDF_BUG(QDF_IS_STATUS_SUCCESS(status));
+
+	osif_driver_sync_unregister();
+	osif_driver_sync_wait_for_ops(driver_sync);
+
+	hdd_driver_mode_change_unregister();
+	pld_deinit();
+
+	hdd_start_complete(errno);
+wakelock_destroy:
+	qdf_wake_lock_destroy(&wlan_wake_lock);
+comp_deinit:
+	hdd_component_deinit();
+hdd_deinit:
+	hdd_deinit();
+trans_stop:
+	osif_driver_sync_trans_stop(driver_sync);
+	osif_driver_sync_destroy(driver_sync);
+sync_deinit:
+	osif_sync_deinit();
+	hdd_qdf_deinit();
+
+exit:
+	return errno;
+}
+
+/**
+ * hdd_driver_unload() - Performs the driver-level unload operation
+ *
+ * Note: this is used in both static and DLKM driver builds
+ *
+ * Return: None
+ */
+static void hdd_driver_unload(void)
+{
+	struct osif_driver_sync *driver_sync;
 	struct hdd_context *hdd_ctx;
 
 	hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
@@ -14887,7 +15021,71 @@ static int con_mode_handler(const char *kmessage, const struct kernel_param *kp)
 	ret = __con_mode_handler(kmessage, kp, hdd_ctx);
 	cds_ssr_unprotect(__func__);
 
+	/* trigger SoC remove */
+	wlan_hdd_unregister_driver();
+
+	status = osif_driver_sync_trans_start_wait(&driver_sync);
+	QDF_BUG(QDF_IS_STATUS_SUCCESS(status));
+	if (QDF_IS_STATUS_ERROR(status)) {
+		hdd_err("Unable to unload wlan; status:%u", status);
+		return;
+	}
+
+	osif_driver_sync_unregister();
+	osif_driver_sync_wait_for_ops(driver_sync);
+
+	hdd_driver_mode_change_unregister();
+	pld_deinit();
+	wlan_hdd_state_ctrl_param_destroy();
+	hdd_set_conparam(0);
+	qdf_wake_lock_destroy(&wlan_wake_lock);
+	hdd_component_deinit();
+	hdd_deinit();
+
+	osif_driver_sync_trans_stop(driver_sync);
+	osif_driver_sync_destroy(driver_sync);
+
+	osif_sync_deinit();
+
+	hdd_qdf_deinit();
+}
+
+/**
+ * hdd_module_init() - Module init helper
+ *
+ * Module init helper function used by both module and static driver.
+ *
+ * Return: 0 for success, errno on failure
+ */
+static int hdd_module_init(void)
+{
+	int ret;
+
+	ret = wlan_hdd_state_ctrl_param_create();
+	if (ret)
+		pr_err("wlan_hdd_state_create:%x\n", ret);
+
 	return ret;
+}
+
+#undef hdd_fln
+
+/**
+ * hdd_module_exit() - Exit function
+ *
+ * This is the driver exit point (invoked when module is unloaded using rmmod)
+ *
+ * Return: None
+ */
+static void __exit hdd_module_exit(void)
+{
+	hdd_driver_unload();
+}
+
+static int fwpath_changed_handler(const char *kmessage,
+				  const struct kernel_param *kp)
+{
+	return param_set_copystring(kmessage, kp);
 }
 
 static int con_mode_handler_ftm(const char *kmessage,
